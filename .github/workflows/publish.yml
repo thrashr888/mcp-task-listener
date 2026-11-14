@@ -1,0 +1,27 @@
+# Publish to npm via OIDC trusted publishing (no stored token).
+# One-time setup (npm account owner, on npmjs.com): link the
+# mcp-task-listener package to this repo as a trusted publisher
+# (repository thrashr888/mcp-task-listener, workflow publish.yml,
+# no environment). After that, creating a GitHub Release publishes it.
+name: Publish to npm
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm test
+      - run: npm publish --provenance
