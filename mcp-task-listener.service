@@ -1,0 +1,28 @@
+[Unit]
+Description=MCP task listener (wakes the agent on new tasks)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Install mcp-task-listener.mjs at this path (or adjust ExecStart to where you put it).
+ExecStart=/usr/bin/env node /usr/local/share/mcp-task-listener/mcp-task-listener.mjs
+Restart=on-failure
+RestartSec=10
+# The MCP endpoint and the tasks resource to subscribe to. The example below
+# is Guildworks; point these at your own server's URL, resource URI, and
+# inbox tool. {agentId} is filled from MCP_AGENT_ID.
+Environment=MCP_URL=https://dev.guildworks.io/mcp
+Environment=MCP_TASKS_URI=guildworks://agent/{agentId}/tasks
+Environment=MCP_AGENT_ID=REPLACE_WITH_AGENT_ID
+Environment=MCP_INBOX_TOOL=gw_tasks_inbox
+# Token file: JSON with access_token, refresh_token, client_id (see README).
+# The listener refreshes the access token itself and writes the file back.
+Environment=MCP_TOKEN_FILE=%h/.config/mcp-task-listener/token.json
+Environment=MCP_STATE_FILE=%h/.config/mcp-task-listener/state.json
+# Optional: a shell command run per new task, with the task JSON on stdin.
+# Example for a Pi agent: a script that messages the Pi RPC server.
+# Environment=WAKE_COMMAND=/usr/local/bin/mcp-wake-pi.sh
+
+[Install]
+WantedBy=default.target
