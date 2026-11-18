@@ -13,7 +13,7 @@ this listener acts on it within seconds.
 - Reads the inbox once on connect (live notices are not replayed).
 - On a task notification it re-reads the inbox (via `MCP_INBOX_TOOL`), and
   for each **new** task it runs your wake command (`WAKE_COMMAND`) with the
-  task JSON on stdin. With no wake command it just logs the new task.
+  task JSON on stdin. With no wake command it logs the task without marking it delivered.
 - On a 401 it refreshes the access token (if a refresh token is configured)
   and reconnects; otherwise it exits so systemd/launchd restarts it.
 
@@ -151,3 +151,37 @@ and wakes on a push (no live server needed).
   directly instead of shelling out).
 - An installer: one command that sets up the listener, the token file,
   and the systemd/launchd unit for you.
+
+## Delivery and recovery guarantees
+
+A task is recorded as seen only after the wake handler returns success. Failed
+launches and nonzero exits remain eligible on the next notification or reconnect.
+Notices arriving during an inbox read or wake are coalesced into another inbox
+read. If a read or state save throws with a queued notice, one immediate
+retry is allowed; a second check failure exits the drain. Recovery then waits
+for a later notification or reconnect, not an automatic retry timer. Successful tasks are saved individually, so a later
+failed wake does not discard earlier progress.
+
+This is at-least-once wake delivery, not exactly-once task execution. A crash
+between a successful wake and saving state can wake the task again. The agent
+must reconcile the durable task state and claim it through the server before
+working; never treat a notification as authorization. No periodic inbox polling
+is introduced. A failed wake is retried by later notifications or reconnect, not
+by an unbounded immediate loop. A queued notification permits one immediate retry
+per failed task; further attempts wait for another notification or reconnect.
+Wake exceptions do not prevent other tasks or queued notices from being handled.
+A failed state save can repeat a successful wake during the bounded retry; the
+server-side claim remains necessary.
+
+The state file still uses a non-atomic write and has no multi-process lock. A
+crash during that write or multiple listeners sharing one file may lose dedup
+state and repeat wakes. This patch does not provide crash-safe persistence.
+Reconnect recovery tests currently exercise explicit reconnection with a fake
+client; the real SDK test covers initial connection and a live push, not transport
+loss and resubscription. Do not infer verified real-network recovery from those
+tests.
+
+Embedding hosts may supply an async `wakeTask(task)` callback instead of a shell
+command. Return `true` only when the native wake has succeeded; return `false` or
+throw on failure. This is a host adapter, not proof of built-in support in an
+agent application.
