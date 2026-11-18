@@ -157,6 +157,7 @@ export function createListener(config) {
     tokenFile,
     tokenUrl,
     wakeCommand,
+    wakeTask = wakeCommand ? task => runWakeCommand(wakeCommand, task) : null,
     stateFile = './mcp-task-listener-state.json',
     makeClient = defaultMakeClient,
   } = config ?? {};
@@ -174,7 +175,7 @@ export function createListener(config) {
   }
   if (!accessToken) throw new Error('no access token: set MCP_TOKEN or MCP_TOKEN_FILE');
   let seen = loadState(stateFile);
-  let client = null, stopped = false, checking = false;
+  let client = null, stopped = false, checking = false, pendingCheck = false;
 
   function defaultMakeClient(bearer) {
     const transport = new StreamableHTTPClientTransport(new URL(mcpUrl), {
@@ -185,21 +186,49 @@ export function createListener(config) {
   }
 
   async function checkInbox() {
-    if (checking || !client) return;
+    if (!client || stopped) return;
+    if (checking) { pendingCheck = true; return; }
     checking = true;
+    const attempts = new Map();
+    let failedChecks = 0;
     try {
-      const result = await client.callTool({ name: inboxTool, arguments: inboxArgs });
-      const tasks = parseInboxResult(result, tasksField);
-      const fresh = newTasks(seen, tasks, taskIdField);
-      if (!fresh.length) { log('info', 'inbox check: no new tasks'); return; }
-      for (const task of fresh) {
-        const id = taskIdOf(task, taskIdField) ?? '?';
-        log('info', `new task ${id}`);
-        if (wakeCommand) await runWakeCommand(wakeCommand, task);
-        else log('info', `no wake command configured; task ${id} left for the agent to pick up`);
-      }
-      seen = [...seen, ...fresh.map(t => taskIdOf(t, taskIdField)).filter(Boolean)];
-      saveState(stateFile, seen);
+      do {
+        pendingCheck = false;
+        try {
+          const result = await client.callTool({ name: inboxTool, arguments: inboxArgs });
+          const tasks = parseInboxResult(result, tasksField);
+          const fresh = newTasks(seen, tasks, taskIdField);
+          if (!fresh.length) log('info', 'inbox check: no new tasks');
+          for (const task of fresh) {
+            if (stopped) break;
+            const id = taskIdOf(task, taskIdField) ?? '?';
+            log('info', `new task ${id}`);
+            if (!wakeTask) {
+              log('info', `no wake command configured; task ${id} remains pending`);
+              continue;
+            }
+            // Drain queued notices even when one wake throws. Bound immediate retries
+            // per task so a failing handler that also notifies cannot spin forever.
+            const count = attempts.get(id) ?? 0;
+            if (count >= 2) continue;
+            attempts.set(id, count + 1);
+            let delivered = false;
+            try { delivered = await wakeTask(task); }
+            catch (e) { log('error', `wake failed for ${id}: ${e.message}`); }
+            if (!delivered) continue;
+            const nextSeen = [...seen, id];
+            saveState(stateFile, nextSeen);
+            seen = nextSeen;
+          }
+        } catch (e) {
+          // A notice queued during a failed read/save deserves a bounded drain,
+          // but persistent failure must return control rather than spin.
+          failedChecks++;
+          if (!pendingCheck || failedChecks >= 2 || stopped) throw e;
+          log('error', `inbox check failed; draining queued notice: ${e.message}`);
+        }
+        // Coalesce notices arriving during inbox/wake work instead of losing them.
+      } while (pendingCheck && !stopped);
     } catch (e) {
       log('error', `inbox check failed: ${e.message}`);
       throw e;

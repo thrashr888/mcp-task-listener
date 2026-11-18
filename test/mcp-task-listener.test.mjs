@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
@@ -110,7 +110,7 @@ test('listener subscribes to the tasks resource, reads the inbox on connect, and
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('listener without a wake command logs new tasks and still records them as seen', async () => {
+test('listener without a wake command logs tasks without consuming them', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'mcp-listener-nowake-'));
   try {
     const stateFile = join(dir, 'state.json');
@@ -126,8 +126,8 @@ test('listener without a wake command logs new tasks and still records them as s
       stateFile, makeClient: () => ({ client: fakeClient, transport: {} }),
     });
     await listener.connect();
-    assert.deepEqual(listener.seen, ['t9']);
-    assert.deepEqual(loadState(stateFile), ['t9']);
+    assert.deepEqual(listener.seen, []);
+    assert.deepEqual(loadState(stateFile), []);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -213,4 +213,152 @@ test('live end-to-end: the real SDK listener wakes when the mock server pushes a
   assert.deepEqual(woken.map(t => t.taskId), ['m1', 'm2'], 'woke for the new task on the push, not again for the old one');
   assert.deepEqual(listener.seen, ['m1', 'm2']);
   listener.stop();
+});
+
+function recoveryFixture(t, { callTool, wakeTask }) {
+  const dir = mkdtempSync(join(tmpdir(), 'mcp-recovery-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  let handler;
+  const client = { connect: async () => {}, subscribeResource: async () => {},
+    setNotificationHandler: (_schema, callback) => { handler = callback; }, callTool, close: () => {} };
+  const options = { mcpUrl: 'https://example.test/mcp', tasksUri: 'tasks://test', token: 'synthetic',
+    stateFile: join(dir, 'state.json'), wakeTask, makeClient: () => ({ client, transport: {} }) };
+  return { options, listener: createListener(options), notify: () => handler({ params: { uri: 'tasks://test' } }) };
+}
+
+test('failed wake remains pending and retries after reconnect without repeating successful work', async t => {
+  const attempted = [];
+  let fail = true;
+  const fixture = recoveryFixture(t, { callTool: async () => ({ structuredContent: { tasks: [{ taskId: 'ok' }, { taskId: 'retry' }] } }),
+    wakeTask: async task => { attempted.push(task.taskId); return task.taskId !== 'retry' || !fail; } });
+  await fixture.listener.connect();
+  assert.deepEqual(fixture.listener.seen, ['ok']);
+  fail = false;
+  await fixture.listener.connect();
+  assert.deepEqual(fixture.listener.seen, ['ok', 'retry']);
+  assert.deepEqual(attempted, ['ok', 'retry', 'retry']);
+  const restarted = createListener(fixture.options);
+  await restarted.connect();
+  assert.deepEqual(attempted, ['ok', 'retry', 'retry'], 'persisted successes survive restart');
+});
+
+test('notification during wake causes another inbox read without overlapping wakes', async t => {
+  let reads = 0, active = 0, peak = 0, fixture;
+  const woken = [];
+  fixture = recoveryFixture(t, { callTool: async () => ({ structuredContent: { tasks: ++reads === 1 ? [{ taskId: 'first' }] : [{ taskId: 'first' }, { taskId: 'second' }] } }),
+    wakeTask: async task => { active++; peak = Math.max(peak, active); woken.push(task.taskId); if (task.taskId === 'first') await fixture.notify(); active--; return true; } });
+  await fixture.listener.connect();
+  assert.equal(reads, 2);
+  assert.equal(peak, 1);
+  assert.deepEqual(woken, ['first', 'second']);
+});
+
+test('no wake handler does not consume durable work', async t => {
+  const fixture = recoveryFixture(t, { callTool: async () => ({ structuredContent: { tasks: [{ taskId: 'pending' }] } }) });
+  await fixture.listener.connect();
+  assert.deepEqual(fixture.listener.seen, []);
+});
+
+test('successful tasks persist before a later wake throws', async t => {
+  const fixture = recoveryFixture(t, { callTool: async () => ({ structuredContent: { tasks: [{ taskId: 'ok' }, { taskId: 'bad' }] } }),
+    wakeTask: async task => { if (task.taskId === 'bad') throw new Error('synthetic failure'); return true; } });
+  await fixture.listener.connect();
+  assert.deepEqual(loadState(fixture.options.stateFile), ['ok']);
+});
+
+test('real failed wake subprocess is not marked delivered', async t => {
+  const fixture = recoveryFixture(t, { callTool: async () => ({ structuredContent: { tasks: [{ taskId: 'failed-process' }] } }) });
+  const listener = createListener({ ...fixture.options, wakeCommand: 'exit 1' });
+  await listener.connect();
+  assert.deepEqual(listener.seen, []);
+  assert.deepEqual(loadState(fixture.options.stateFile), []);
+});
+
+test('notification received during inbox read is not dropped', async t => {
+  let reads = 0, fixture;
+  fixture = recoveryFixture(t, { callTool: async () => {
+    reads++;
+    if (reads === 1) await fixture.notify();
+    return { structuredContent: { tasks: [] } };
+  }});
+  await fixture.listener.connect();
+  assert.equal(reads, 2);
+});
+
+
+test('wake exception drains a queued notification without needing a third event', async t => {
+  let fixture, reads = 0, attempts = 0;
+  const woke = [];
+  fixture = recoveryFixture(t, {
+    callTool: async () => ({ structuredContent: { tasks: ++reads === 1 ? [{ taskId: 'retry' }] : [{ taskId: 'retry' }, { taskId: 'arrived' }] } }),
+    wakeTask: async task => {
+      if (task.taskId === 'retry' && ++attempts === 1) {
+        await fixture.notify();
+        throw new Error('wake failed after new notification');
+      }
+      woke.push(task.taskId); return true;
+    },
+  });
+  await fixture.listener.connect();
+  assert.equal(reads, 2);
+  assert.deepEqual(woke, ['retry', 'arrived']);
+  assert.deepEqual(fixture.listener.seen, ['retry', 'arrived']);
+});
+
+test('persistent wake exception plus notification has bounded retries and preserves other work', async t => {
+  let fixture, reads = 0, attempts = 0;
+  fixture = recoveryFixture(t, {
+    callTool: async () => { reads++; return { structuredContent: { tasks: [{ taskId: 'bad' }, { taskId: 'good' }] } }; },
+    wakeTask: async task => {
+      if (task.taskId === 'bad') { attempts++; await fixture.notify(); throw new Error('persistent'); }
+      return true;
+    },
+  });
+  await fixture.listener.connect();
+  assert.equal(attempts, 2);
+  assert.equal(reads, 3);
+  assert.deepEqual(fixture.listener.seen, ['good']);
+  await fixture.notify();
+  assert.equal(attempts, 4, 'a later event permits a new bounded attempt cycle');
+});
+
+
+test('queued notification recovers a failed inbox read without a third event', async t => {
+  let reads = 0, fixture;
+  fixture = recoveryFixture(t, {
+    callTool: async () => {
+      reads++;
+      if (reads === 2) { await fixture.notify(); throw new Error('transient read'); }
+      return { structuredContent: { tasks: reads >= 3 ? [{ taskId: 'arrived' }] : [] } };
+    },
+    wakeTask: async () => true,
+  });
+  await fixture.listener.connect();
+  await fixture.notify();
+  assert.equal(reads, 3);
+  assert.deepEqual(fixture.listener.seen, ['arrived']);
+});
+
+test('persistent inbox failure plus queued notifications is bounded', async t => {
+  let reads = 0, fixture;
+  fixture = recoveryFixture(t, {
+    callTool: async () => { reads++; await fixture.notify(); throw new Error('persistent read'); },
+    wakeTask: async () => true,
+  });
+  await assert.rejects(fixture.listener.connect(), /persistent read/);
+  assert.equal(reads, 2);
+  assert.deepEqual(fixture.listener.seen, []);
+});
+
+
+test('state save failure with queued notices is bounded and never marks seen', async t => {
+  let fixture, wakes = 0;
+  fixture = recoveryFixture(t, {
+    callTool: async () => ({ structuredContent: { tasks: [{ taskId: 'unsaved' }] } }),
+    wakeTask: async () => { wakes++; await fixture.notify(); return true; },
+  });
+  mkdirSync(fixture.options.stateFile); // force an actual filesystem write failure
+  await assert.rejects(fixture.listener.connect(), /EISDIR/);
+  assert.equal(wakes, 2, 'successful wake may repeat when persistence fails');
+  assert.deepEqual(fixture.listener.seen, []);
 });
